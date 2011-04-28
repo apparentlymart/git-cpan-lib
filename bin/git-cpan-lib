@@ -1,0 +1,118 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+git-cpan-lib - Produces a git commit containing some CPAN modules
+
+=head1 SYNOPSIS
+
+    git-cpan-lib [options] <module> [module ...]
+
+    Prints the id of the created commit to stdout, and doesn't
+    affect the current working copy or index.
+
+    Options:
+        --parent    Give something git can parse as a commit to
+                  specify the parent of the generated commit.
+                  The default is HEAD.
+
+    Environment:
+        GIT_DIR     Set this to explicitly name the git direcory
+                  to work in. If not set, the default is the normal
+                  git behavior of searching up until a .git directory
+                  is found.
+
+=head1 WHY?
+
+As well as being an awesome change management tool, git is pretty good
+at efficiently pushing around trees of files. If you've embraced the
+philosophy that git can and should be used to solve every problem,
+here's a tool to solve the problem of building CPAN modules and creating
+a commit of the result so that it can easily be pushed wherever you
+like.
+
+=head1 AUTHOR
+
+By Martin Atkins. Released into the public domain. Enjoy!
+
+=cut
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use File::Temp;
+use Symbol qw(gensym);
+use IPC::Open2 qw(open2);
+
+my $help = 0;
+my $parent = 'HEAD';
+Getopt::Long::GetOptions(
+    'help' => \$help,
+    'parent=s', \$parent,
+) || pod2usage(2);
+pod2usage(0) if $help;
+
+my $parent_commit_id = git_rev_parse($parent);
+
+my @modules = @ARGV;
+
+my $work_dir = File::Temp::tempdir(CLEANUP => 1);
+my ($index_file_fh, $index_file) = File::Temp::tempfile;
+close($index_file_fh);
+unlink($index_file);
+
+run('cpanm', [ "-L", $work_dir, "--", @modules ]);
+
+my $commit_id;
+{
+    local $ENV{'GIT_INDEX_FILE'} = $index_file;
+    local $ENV{'GIT_WORK_TREE'} = $work_dir;
+
+    # Put all of the files in the index.
+    run('git', ['add', '--all']);
+
+    my $tree_id  = run('git', ['write-tree']);
+    chomp $tree_id;
+
+    my $message = "Built with git-cpan-lib.\n\nIncluded modules:\n\n".join("\n", @modules);
+
+    $commit_id = run('git', ['commit-tree', $tree_id, '-p', $parent_commit_id], $message);
+    chomp $commit_id;
+}
+
+# If we're on a tty the print a newline. Otherwise, just the bare commit id
+# so the output is easier to consume by other programs.
+if (-t STDOUT) {
+    print "$commit_id\n";
+}
+else {
+    print "$commit_id";
+}
+
+sub run {
+    my ($cmd, $args, $stdin) = @_;
+    my $there = gensym();
+    my $back = gensym();
+    my $pid = open2($back, $there, $cmd, ($args ? @$args : ()));
+    if (defined($stdin)) {
+        print $there $stdin;
+    }
+    close($there);
+    my $stdout = join('', <$back>);
+    close($back);
+    waitpid($pid, 0);
+    my $child_exit_status = $? >> 8;
+    Carp::croak("$cmd".($args ? join(" ", '', @$args) : '')." failed with status $child_exit_status") if $child_exit_status != 0;
+    return $stdout;
+}
+
+sub git_rev_parse {
+    my ($string) = @_;
+
+    my $commit_id = run('git', [ 'rev-parse', $string ]);
+    chomp $commit_id;
+    return $commit_id;
+}
+
